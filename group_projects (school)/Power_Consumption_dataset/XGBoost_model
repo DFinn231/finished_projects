@@ -1,0 +1,233 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+# 1. LOAD DATA
+filename = "electricity_consumption_ready.csv" #added because it is in the same filemap of this code, change to filepath if needed
+df = pd.read_csv(filename,)
+
+
+df["DateUTC"] = pd.to_datetime(df["DateUTC"])
+df = df.sort_values("DateUTC").reset_index(drop=True)
+df = df[["DateUTC", "Value", "temperature_2m"]]
+
+
+
+# 2. SETTINGS
+
+FREQ        = 4
+MONTH_STEPS = 30 * 24 * FREQ   # 2880 steps = ~1 month
+
+
+# 3. FEATURE ENGINEERING
+
+def create_features(data):         
+    d = data.copy()                # Create a copy of the dataset
+
+    # Calendar
+    d["hour"]       = d["DateUTC"].dt.hour        # Extract hour of the day
+    d["dayofweek"]  = d["DateUTC"].dt.dayofweek   # Extract day of the week (0=Monday)
+    d["month"]      = d["DateUTC"].dt.month       # Extract month
+    d["quarter"]    = d["DateUTC"].dt.quarter     # Extract quarter of the year
+    d["is_weekend"] = (d["dayofweek"] >= 5).astype(int)   # Mark weekends (1 if Saturday/Sunday)
+
+    # Lag features 
+    d["lag_96"]  = d["Value"].shift(96)    # Consumption at same time yesterday (96 steps = 24h)
+    d["lag_672"] = d["Value"].shift(672)   # Consumption at same time last week
+
+    d["roll_mean_day"]  = d["Value"].shift(96).rolling(96).mean()   # Average consumption of the previous day
+    d["roll_mean_week"] = d["Value"].shift(672).rolling(672).mean() # Average consumption of the previous week
+
+    return d       
+
+
+
+df_feat = create_features(df)
+
+# Drop NaNs only from the front 
+# The test slice has no NaNs — its lags already resolve into training data
+df_feat = df_feat.dropna().reset_index(drop=True)
+
+
+# 4. TRAIN / TEST SPLIT  (last ~month = test)
+
+train = df_feat.iloc[:-MONTH_STEPS]      # Training data = everything except the last month
+test  = df_feat.iloc[-MONTH_STEPS:]      # Test data = last month
+
+FEATURE_COLS = [
+    "hour", "dayofweek", "month", "quarter", "is_weekend",
+    "lag_96", "lag_672",
+    "roll_mean_day", "roll_mean_week",
+    "temperature_2m"
+]
+
+X_train, y_train = train[FEATURE_COLS], train["Value"]
+X_test,  y_test  = test[FEATURE_COLS],  test["Value"]
+dates_test = test["DateUTC"]
+
+
+
+# 5. TRAIN MODEL
+
+model = XGBRegressor(
+    n_estimators=500,       # number of trees to build 
+    learning_rate=0.05,     # how much each tree corrects the previous — small 
+    max_depth=5,            # how deep each tree can grow — deeper 
+    subsample=0.8,          # each tree only sees 80% of rows (random sample) 
+    colsample_bytree=0.8,   # each tree only sees 80% of features (random sample) 
+    random_state=42,   # fixes randomness so results are reproducible
+    n_jobs=-1       #distributes the workload across all CPU simultaneously
+)
+
+model.fit(
+    X_train, y_train,               # training features and target values
+    eval_set=[(X_test, y_test)],    # monitor performance on test set during training (for early stopping if needed)
+    verbose=False                   # suppress per-tree training logs
+)
+
+
+# 6. BACKTEST (last month)
+
+y_pred = model.predict(X_test)
+
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+mae  = mean_absolute_error(y_test, y_pred)
+r2   = r2_score(y_test, y_pred)
+
+print("Backtest results (last month)")
+print(f"  RMSE : {rmse:.2f}")
+print(f"  MAE  : {mae:.2f}")
+print(f"  R²   : {r2:.4f}")
+
+
+
+# 7. RECURSIVE FORECAST (next month)
+
+history   = df.copy()
+last_date = history["DateUTC"].iloc[-1]
+
+future_predictions = []
+
+for i in range(MONTH_STEPS):
+
+    next_date = last_date + pd.Timedelta(minutes=15)# Calculate next timestamp (15 minutes later)
+
+
+    # Temperature proxy: same slot from 30 days ago
+    temp = history["temperature_2m"].iloc[-(96 * 30)]
+
+    # Append placeholder row so lags/rolling compute correctly
+    new_row = pd.DataFrame({
+        "DateUTC":[next_date],
+        "Value":[np.nan],
+        "temperature_2m":[temp]
+    })
+
+    temp_history = pd.concat([history, new_row], ignore_index=True)
+    temp_feat    = create_features(temp_history)
+
+    X_next     = temp_feat.iloc[[-1]][FEATURE_COLS]
+    next_value = model.predict(X_next)[0]
+
+    future_predictions.append({"DateUTC": next_date, "Predicted": next_value})
+
+    # Commit predicted value so next step's lags are correct
+    history.loc[len(history)] = [next_date, next_value, temp]
+
+    last_date = next_date
+
+    if (i + 1) % 500 == 0:
+        print(f"  Forecast step {i + 1}/{MONTH_STEPS}")
+
+forecast_df = pd.DataFrame(future_predictions)
+print("Forecast complete.")
+
+
+
+# 8. FEATURE IMPORTANCE
+
+importance = pd.Series(model.feature_importances_, index=FEATURE_COLS).sort_values()
+
+plt.figure(figsize=(8, 5))
+importance.plot(kind="barh")
+plt.title("Feature Importance")
+plt.xlabel("Score")
+plt.tight_layout()
+plt.show()
+
+
+
+# 9. FULL OVERVIEW PLOT
+
+plt.figure(figsize=(16, 6))
+plt.plot(df["DateUTC"],df["Value"],label="Historical",alpha=0.7)
+plt.plot(dates_test,y_pred,label="Backtest Predicted",    linestyle="--")
+plt.plot(forecast_df["DateUTC"], forecast_df["Predicted"],  label="Forecast (next month)", linestyle="--")
+plt.axvline(df["DateUTC"].iloc[-MONTH_STEPS], color="grey", linestyle=":", label="Backtest Start")
+plt.axvline(df["DateUTC"].iloc[-1],           color="red",  linestyle=":", label="Forecast Start")
+plt.legend()
+plt.title("Electricity Consumption — Full Overview")
+plt.xlabel("Date")
+plt.ylabel("Consumption")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+
+# 10. ZOOM: BACKTEST
+
+plt.figure(figsize=(16, 6))
+plt.plot(dates_test, y_test, label="Actual",    alpha=0.8)
+plt.plot(dates_test, y_pred, label="Predicted", linestyle="--", alpha=0.8)
+plt.legend()
+plt.title("Backtest: Actual vs Predicted (last month)")
+plt.xlabel("Date")
+plt.ylabel("Consumption")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+
+# 11. ZOOM: FORECAST
+
+plt.figure(figsize=(16, 6))
+plt.plot(forecast_df["DateUTC"], forecast_df["Predicted"], color="green", label="Forecast")
+plt.legend()
+plt.title("Forecast: Next Month")
+plt.xlabel("Date")
+plt.ylabel("Consumption")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+# 12. SCATTER PLOT: Predicted vs Actual (Backtest)
+
+fig, ax = plt.subplots(figsize=(8, 8))
+
+# Scatter points
+ax.scatter(y_pred, y_test, alpha=0.3, s=10, color="#2563EB", edgecolors="none", label="Data points")
+
+# Perfect prediction line (y = x)
+min_val = min(y_test.min(), y_pred.min())
+max_val = max(y_test.max(), y_pred.max())
+ax.plot([min_val, max_val], [min_val, max_val], color="#EF4444", linewidth=1.5, linestyle="--", label="Perfect prediction (y = x)")
+
+# Annotate with metrics
+textstr = f"RMSE: {rmse:.2f}\nMAE:  {mae:.2f}\nR²:   {r2:.4f}"
+ax.text(0.05, 0.95, textstr, transform=ax.transAxes,
+        fontsize=10, verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", edgecolor="#CBD5E1", alpha=0.8))
+
+ax.set_xlabel("Predicted", fontsize=12)
+ax.set_ylabel("True Value", fontsize=12)
+ax.set_title("Predicted vs Actual — Backtest (last month)", fontsize=14)
+ax.legend(fontsize=10)
+ax.set_aspect("equal", adjustable="box")
+plt.tight_layout()
+plt.show()
