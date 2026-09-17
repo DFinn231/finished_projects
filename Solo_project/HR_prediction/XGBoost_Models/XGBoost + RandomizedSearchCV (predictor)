@@ -1,0 +1,267 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             ConfusionMatrixDisplay, accuracy_score, roc_curve, auc)
+import xgboost as xgb
+import matplotlib.pyplot as plt
+# Load data
+df = pd.read_csv("../../Datasets/employee_data_solved.csv")
+
+# Create binary target
+df["attrited"] = df["EmployeeStatus"].isin(
+    ["Voluntarily Terminated", "Terminated for Cause"]
+).astype(int)
+
+# Drop EmployeeStatus since it was used to create the target
+df.drop(columns=["EmployeeStatus"], inplace=True)
+
+# Label encode all categorical columns — store each encoder separately
+categorical_cols = df.select_dtypes(include="object").columns
+label_encoders = {}
+for col in categorical_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    label_encoders[col] = le
+
+# Split features and target
+X = df.drop(columns=["attrited"])
+y = df["attrited"]
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Train XGBoost baseline model with scale_pos_weight
+model = xgb.XGBClassifier(random_state=42, eval_metric="logloss", scale_pos_weight=523/77)
+model.fit(X_train, y_train)
+
+# Predictions
+y_pred = model.predict(X_test)
+y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+# Accuracy score
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print()
+print(classification_report(y_test, y_pred))
+
+# --- Plot 1: Confusion Matrix + ROC Curve ---
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Not Attrited", "Attrited"])
+disp.plot(ax=axes[0], colorbar=False)
+axes[0].set_title("Confusion Matrix")
+
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+roc_auc = auc(fpr, tpr)
+axes[1].plot(fpr, tpr, color="steelblue", label=f"AUC = {roc_auc:.4f}")
+axes[1].plot([0, 1], [0, 1], color="gray", linestyle="--")
+axes[1].set_title("ROC Curve")
+axes[1].set_xlabel("False Positive Rate")
+axes[1].set_ylabel("True Positive Rate")
+axes[1].legend()
+plt.tight_layout()
+plt.savefig("xgb_confusion_roc.png", dpi=150)
+plt.show()
+
+# --- Plot 2: Feature Importance ---
+xgb.plot_importance(model, max_num_features=15)
+plt.title("XGBoost - Top 15 Feature Importances")
+plt.tight_layout()
+plt.savefig("xgb_feature_importance.png", dpi=150)
+plt.show()
+
+# --- Plot 3: Actual vs Predicted ---
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+axes[0].bar(["Not Attrited", "Attrited"],
+            [sum(y_test == 0), sum(y_test == 1)], color="steelblue")
+axes[0].set_title("Actual Attrition (Test Set)")
+axes[0].set_ylabel("Count")
+
+axes[1].bar(["Not Attrited", "Attrited"],
+            [sum(y_pred == 0), sum(y_pred == 1)], color="coral")
+axes[1].set_title("Predicted Attrition (Test Set)")
+axes[1].set_ylabel("Count")
+
+plt.tight_layout()
+plt.savefig("xgb_actual_vs_predicted.png", dpi=150)
+plt.show()
+
+
+# =============================================================================
+# Hyperparameter Tuning with RandomizedSearchCV
+# =============================================================================
+
+param_dist = {
+    "n_estimators": [100, 200, 300, 500],
+    "max_depth": [3, 4, 5, 6, 8],
+    "learning_rate": [0.01, 0.05, 0.1, 0.2],
+    "subsample": [0.6, 0.7, 0.8, 1.0],
+    "colsample_bytree": [0.6, 0.7, 0.8, 1.0],
+    "min_child_weight": [1, 3, 5, 7],
+    "gamma": [0, 0.1, 0.2, 0.5],
+}
+
+xgb_base = xgb.XGBClassifier(
+    random_state=42,
+    eval_metric="logloss",
+    scale_pos_weight=523/77
+)
+
+random_search = RandomizedSearchCV(
+    estimator=xgb_base,
+    param_distributions=param_dist,
+    n_iter=50,
+    scoring="roc_auc",
+    cv=5,
+    verbose=1,
+    random_state=42,
+    n_jobs=-1
+)
+random_search.fit(X_train, y_train)
+print(f"Best parameters: {random_search.best_params_}")
+print(f"Best CV AUC: {random_search.best_score_:.4f}")
+
+best_model = random_search.best_estimator_
+y_pred = best_model.predict(X_test)
+y_pred_proba = best_model.predict_proba(X_test)[:, 1]
+print(f"\nAccuracy: {accuracy_score(y_test, y_pred):.4f}")
+print()
+print(classification_report(y_test, y_pred))
+
+# --- Tuned: Confusion Matrix + ROC Curve ---
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Not Attrited", "Attrited"])
+disp.plot(ax=axes[0], colorbar=False)
+axes[0].set_title("XGBoost Tuned - Confusion Matrix")
+
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+roc_auc = auc(fpr, tpr)
+axes[1].plot(fpr, tpr, color="steelblue", label=f"AUC = {roc_auc:.4f}")
+axes[1].plot([0, 1], [0, 1], color="gray", linestyle="--")
+axes[1].set_title("XGBoost Tuned - ROC Curve")
+axes[1].set_xlabel("False Positive Rate")
+axes[1].set_ylabel("True Positive Rate")
+axes[1].legend()
+plt.tight_layout()
+plt.savefig("xgb_tuned_confusion_roc.png", dpi=150)
+plt.show()
+
+# --- Tuned: Feature Importance ---
+xgb.plot_importance(best_model, max_num_features=15)
+plt.title("XGBoost Tuned - Top 15 Feature Importances")
+plt.tight_layout()
+plt.savefig("xgb_tuned_feature_importance.png", dpi=150)
+plt.show()
+
+
+# =============================================================================
+# Interactive HR Attrition Risk Predictor (uses tuned XGBoost model)
+# =============================================================================
+
+def get_valid_input(prompt, valid_options):
+    while True:
+        value = input(prompt).strip()
+        if value in valid_options:
+            return value
+        print(f"  Invalid input. Choose from: {', '.join(valid_options)}")
+
+def predict_employee():
+    print("\n" + "="*55)
+    print("       HR EMPLOYEE ATTRITION RISK PREDICTOR")
+    print("="*55)
+
+    inputs = {}
+
+    # --- 8 user inputs ---
+    inputs["Title"] = get_valid_input(
+        "\nTitle (Accountant I / Administrative Assistant / Area Sales Manager / BI Developer / BI Director /\n"
+        "  CIO / Data Analyst / Data Architect / Database Administrator / Director of Operations /\n"
+        "  Director of Sales / Enterprise Architect / IT Director / IT Manager - DB / IT Manager - Infra /\n"
+        "  IT Manager - Support / IT Support / Network Engineer / President & CEO / Principal Data Architect /\n"
+        "  Production Manager / Production Technician I / Production Technician II / Sales Manager /\n"
+        "  Senior BI Developer / Shared Services Manager / Software Engineer / Software Engineering Manager /\n"
+        "  Sr. Accountant / Sr. DBA / Sr. Network Engineer): ",
+        ["Accountant I", "Administrative Assistant", "Area Sales Manager", "BI Developer", "BI Director",
+         "CIO", "Data Analyst", "Data Analyst ", "Data Architect", "Database Administrator",
+         "Director of Operations", "Director of Sales", "Enterprise Architect", "IT Director",
+         "IT Manager - DB", "IT Manager - Infra", "IT Manager - Support", "IT Support",
+         "Network Engineer", "President & CEO", "Principal Data Architect", "Production Manager",
+         "Production Technician I", "Production Technician II", "Sales Manager", "Senior BI Developer",
+         "Shared Services Manager", "Software Engineer", "Software Engineering Manager",
+         "Sr. Accountant", "Sr. DBA", "Sr. Network Engineer"]
+    )
+    inputs["Job_Group"] = get_valid_input(
+        "Job Group (Administration / Data & BI / Engineering / Finance / IT / Management / Other / Production / Sales): ",
+        ["Administration", "Data & BI", "Engineering", "Finance", "IT", "Management", "Other", "Production", "Sales"]
+    )
+    inputs["DepartmentType"] = get_valid_input(
+        "Department (Admin Offices / Executive Office / IT/IS / Production        / Sales / Software Engineering): ",
+        ["Admin Offices", "Executive Office", "IT/IS", "Production       ", "Sales", "Software Engineering"]
+    )
+    inputs["State"] = get_valid_input(
+        "State (2-letter code, e.g. MA / WA / CA / TX / ...): ",
+        list(label_encoders["State"].classes_)
+    )
+    inputs["EmployeeType"] = get_valid_input(
+        "Employee Type (Contract / Full-Time / Part-Time): ",
+        ["Contract", "Full-Time", "Part-Time"]
+    )
+    inputs["PayZone"] = get_valid_input(
+        "Pay Zone (Zone A / Zone B / Zone C): ",
+        ["Zone A", "Zone B", "Zone C"]
+    )
+
+    while True:
+        try:
+            inputs["Current Employee Rating"] = int(input("Current Employee Rating (1-5): ").strip())
+            if 1 <= inputs["Current Employee Rating"] <= 5:
+                break
+            print("  Please enter a number between 1 and 5.")
+        except ValueError:
+            print("  Invalid input. Please enter a number.")
+
+    while True:
+        try:
+            inputs["Working_days"] = int(input("Working Days (number of days employed): ").strip())
+            break
+        except ValueError:
+            print("  Invalid input. Please enter a number.")
+
+    # --- Fill non-asked columns with most frequent value from training data ---
+    defaults = {}
+    for col in X.columns:
+        if col not in inputs:
+            defaults[col] = df[col].mode()[0]
+
+    all_inputs = {**inputs, **defaults}
+    input_df = pd.DataFrame([all_inputs])
+
+    # Label encode using the same encoders fitted on training data
+    for col in categorical_cols:
+        if col in input_df.columns:
+            if input_df[col].values[0] not in label_encoders[col].classes_:
+                input_df[col] = 0
+            else:
+                input_df[col] = label_encoders[col].transform(input_df[col])
+
+    # Ensure column order matches training data
+    input_df = input_df[X.columns]
+
+    # Predict using tuned model
+    prediction = best_model.predict(input_df)[0]
+    risk = "WARNING  HIGH RISK" if prediction == 1 else "OK  LOW RISK"
+
+    print("\n" + "="*55)
+    print(f"  ATTRITION RISK: {risk}")
+    print("="*55 + "\n")
+
+# Run the predictor
+predict_employee()
