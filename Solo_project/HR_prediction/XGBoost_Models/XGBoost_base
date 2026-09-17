@@ -1,1 +1,79 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             ConfusionMatrixDisplay, accuracy_score, roc_curve, auc)
+import xgboost as xgb
+import matplotlib.pyplot as plt
 
+df = pd.read_csv("../../Datasets/employee_data_solved.csv")
+
+df["attrited"] = df["EmployeeStatus"].isin(
+    ["Voluntarily Terminated", "Terminated for Cause"]
+).astype(int)
+
+df.drop(columns=["EmployeeStatus"], inplace=True)
+
+categorical_cols = df.select_dtypes(include="object").columns
+le = LabelEncoder()
+for col in categorical_cols:
+    df[col] = le.fit_transform(df[col])
+
+X = df.drop(columns=["attrited"])
+y = df["attrited"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+model = xgb.XGBClassifier(random_state=42, eval_metric="logloss")
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print()
+print(classification_report(y_test, y_pred))
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Not Attrited", "Attrited"])
+disp.plot(ax=axes[0], colorbar=False)
+axes[0].set_title("Confusion Matrix")
+
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+roc_auc = auc(fpr, tpr)
+axes[1].plot(fpr, tpr, color="steelblue", label=f"AUC = {roc_auc:.4f}")
+axes[1].plot([0, 1], [0, 1], color="gray", linestyle="--")
+axes[1].set_title("ROC Curve")
+axes[1].set_xlabel("False Positive Rate")
+axes[1].set_ylabel("True Positive Rate")
+axes[1].legend()
+plt.tight_layout()
+plt.savefig("XGBoost_normal_Confusion+ROC.png", dpi=150)
+plt.show()
+
+xgb.plot_importance(model, max_num_features=15)
+plt.title("XGBoost - Top 15 Feature Importances")
+plt.tight_layout()
+plt.savefig("XGBoost_normal_feature", dpi=150)
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+axes[0].bar(["Not Attrited", "Attrited"],
+            [sum(y_test == 0), sum(y_test == 1)], color="steelblue")
+axes[0].set_title("Actual Attrition (Test Set)")
+axes[0].set_ylabel("Count")
+
+axes[1].bar(["Not Attrited", "Attrited"],
+            [sum(y_pred == 0), sum(y_pred == 1)], color="coral")
+axes[1].set_title("Predicted Attrition (Test Set)")
+axes[1].set_ylabel("Count")
+
+plt.tight_layout()
+plt.savefig("XGBoost_normal_attrition", dpi=150)
+plt.show()
